@@ -1,0 +1,98 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── Terraform ──────────────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: infra
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: infra
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: infra
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Web App Name
+        id: tf_outputs
+        working-directory: infra
+        run: |
+          echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
+          echo "default_hostname=$(terraform output -raw default_hostname)" >> $GITHUB_OUTPUT
+
+      # ── Build & Publish ────────────────────────────────────────────────────
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build & Publish
+        run: |
+          dotnet publish src/WebApp001/WebApp001.csproj \
+            --configuration Release \
+            --output ./publish
+
+      # ── Deploy ─────────────────────────────────────────────────────────────
+      - name: Deploy to Azure App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.tf_outputs.outputs.webapp_name }}
+          package: ./publish
+
+      # ── Smoke Test ─────────────────────────────────────────────────────────
+      - name: Smoke Test /health
+        run: |
+          HOSTNAME="${{ steps.tf_outputs.outputs.default_hostname }}"
+          echo "Testing $HOSTNAME/health ..."
+          for i in {1..6}; do
+            STATUS=$(curl -s -o /tmp/body -w "%{http_code}" "$HOSTNAME/health")
+            BODY=$(cat /tmp/body)
+            echo "Attempt $i: HTTP $STATUS — $BODY"
+            if [ "$STATUS" = "200" ] && echo "$BODY" | grep -q "OK"; then
+              echo "✅ Smoke test passed"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "❌ Smoke test failed after retries"
+          exit 1
